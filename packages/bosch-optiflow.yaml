@@ -1,0 +1,927 @@
+# =============================================================================
+# Bosch Optiflow / PowerBus-over-BLE package for ESPHome
+#
+# Include from any ESP32 (esp-idf framework) device config:
+#
+#   substitutions:
+#     bosch_mac: "AA:BB:CC:DD:EE:FF"   # the heater's Bluetooth address
+#     bosch_pin: "123456"              # the pairing PIN printed on the heater
+#
+#   packages:
+#     bosch: github://scottbambrick/ha-bosch-optiflow/packages/bosch-optiflow.yaml@main
+#
+# bosch_mac and bosch_pin are required. See README.md.
+#
+# PROTOCOL SUMMARY
+# Every message on characteristic EDB2 is a Bosch "PowerBus" frame:
+#     7B 7B | sender receiver msg_id command data... | checksum | 7D 7D
+#   - checksum = sum of the bytes between the markers, mod 256
+#   - byte stuffing: any 7B or 7D inside the frame is followed by an extra 00
+#   - obfuscation: each byte XORed with ASCII "1ag3.-fs7", repeating, key
+#     restarting at the start of every 20-byte BLE packet
+# Addresses: 0x00 heater, 0x21 app (us), 0x20 wired controller,
+#            0xFF broadcast, 0xAB login handler
+# Commands:  0xA0 status broadcast (~4 s)       0xA2 login
+#            0xD2 read param [loc, params..]    0xD3 write param
+#            0xD7 fault history [count]         0xD8 firmware version
+#            0xB0 history [3]=last uses, [2]=hours/cycles
+# Only reads the official app sends itself are used, plus the setpoint write.
+# =============================================================================
+
+substitutions:
+  # bosch_mac and bosch_pin have no defaults: set them in your device file.
+  bosch_ref: main  # branch/tag of this repo to load the C++ helpers from
+  bosch_service: "FF4396A6-50A8-4FC0-BCF6-228E82DFEDB0"
+  bosch_char: "FF4396A6-50A8-4FC0-BCF6-228E82DFEDB2"
+  # Log level for the BLE plumbing. Set to DEBUG (in the device file's
+  # substitutions) to troubleshoot connection problems.
+  bosch_ble_log_level: WARN
+
+external_components:
+  - source: github://scottbambrick/ha-bosch-optiflow@${bosch_ref}
+    components: [bosch_optiflow]
+
+# Makes the protocol helpers (bosch_encode / bosch_receive ...) available.
+bosch_optiflow:
+
+logger:
+  logs:
+    # BLE plumbing is quiet unless something goes wrong. Heater events are
+    # logged under the "bosch" tag instead.
+    esp32_ble: ${bosch_ble_log_level}
+    esp32_ble_client: ${bosch_ble_log_level}
+    esp32_ble_tracker: ${bosch_ble_log_level}
+    ble_client: ${bosch_ble_log_level}
+    ble_sensor: ${bosch_ble_log_level}
+    script: WARN
+
+# The heater only talks to devices it has been paired with (Bluetooth
+# bonding, using the PIN as the passkey). Pairing happens once, the first
+# time this ESP32 connects; both sides remember it afterwards.
+esp32_ble:
+  io_capability: keyboard_only
+
+esp32_ble_tracker:
+
+ble_client:
+  - mac_address: ${bosch_mac}
+    id: bosch_heater
+    auto_connect: true
+    on_connect:
+      then:
+        # 1) First connection from this ESP32? Pair with the heater (once).
+        - lambda: |-
+            id(bosch_last_rx) = millis();
+            bool bonded = false;
+            int n = esp_ble_get_bond_device_num();
+            if (n > 0) {
+              std::vector<esp_ble_bond_dev_t> list(n);
+              esp_ble_get_bond_device_list(&n, list.data());
+              for (int i = 0; i < n; i++)
+                if (memcmp(list[i].bd_addr, id(bosch_heater)->get_remote_bda(), 6) == 0) bonded = true;
+            }
+            id(bosch_pairing) = !bonded;
+            if (!bonded) {
+              ESP_LOGI("bosch", "Connected to heater - not paired yet, pairing with PIN");
+              esp_ble_set_encryption(id(bosch_heater)->get_remote_bda(), ESP_BLE_SEC_ENCRYPT_MITM);
+            }
+        - delay: !lambda 'return id(bosch_pairing) ? 4000 : 0;'
+        # 2) The heater drops the link unless EDB3 notifications are enabled
+        #    before the login - matching what the real app does.
+        - lambda: |-
+            ESP_LOGD("bosch", "Connected to heater - logging in");
+            id(bosch_heater)->register_for_notify(0x002B);
+            id(bosch_msg_id) = 0;
+            id(bosch_last_rx) = millis();
+        # Login works like the app: it pauses 1 s, sends step 1 ("connect"),
+        # waits for the heater's reply, pauses 1 s, sends step 2 (the PIN),
+        # and only starts asking for data once that is accepted. The next
+        # steps are triggered from the receiver when each reply arrives.
+        - delay: 1s
+        - script.execute:
+            id: bosch_send
+            cmd: 162
+            payload: !lambda 'return std::vector<int>{7, 2, 0, 0, 0, 0, 0};'
+    # The heater asks for the passkey during pairing: it's the PIN.
+    on_passkey_request:
+      then:
+        - lambda: |-
+            ESP_LOGI("bosch", "Heater requested the pairing PIN - sending it");
+            esp_ble_passkey_reply(id(bosch_heater)->get_remote_bda(), true, atoi("${bosch_pin}"));
+    on_disconnect:
+      then:
+        - logger.log:
+            level: WARN
+            tag: bosch
+            format: "Disconnected from heater"
+
+globals:
+  # PowerBus message counter, restarted at 0 each connection (login = 0, 1).
+  - id: bosch_msg_id
+    type: int
+    restore_value: no
+    initial_value: '0'
+  # Gas type reported by the heater (0=G20 NG, 1=G30, 2=G31 propane, 3=G25,
+  # 4=G20 1.8mm). Needed to turn litres of gas into energy.
+  - id: bosch_gas_type
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  # millis() when we last heard anything from the heater (for the watchdog).
+  - id: bosch_last_rx
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  # True while a first-time pairing is in progress on this connection.
+  - id: bosch_pairing
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # Running totals of hot water uses (see "Hot Water Total Volume/Gas"):
+  # litres of water and litres of gas...
+  - id: bosch_total_water_l
+    type: float
+    restore_value: yes
+    initial_value: '0'
+  - id: bosch_total_gas_l
+    type: float
+    restore_value: yes
+    initial_value: '0'
+  # ...and the newest uses already counted, to carry on after a reboot.
+  - id: bosch_saved_use_count
+    type: int
+    restore_value: yes
+    initial_value: '0'
+  - id: bosch_saved_use_0
+    type: uint64_t
+    restore_value: yes
+    initial_value: '0'
+  - id: bosch_saved_use_1
+    type: uint64_t
+    restore_value: yes
+    initial_value: '0'
+  - id: bosch_saved_use_2
+    type: uint64_t
+    restore_value: yes
+    initial_value: '0'
+  # Shower attribution. The device config sets bosch_shower_running from its
+  # shower flow sensor (via the bosch_shower_started/stopped scripts). Hot water
+  # flow is integrated between heater polls, in total and while the shower
+  # runs, and each new amount of water/gas is split in that ratio.
+  - id: bosch_shower_running
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: bosch_shower_start_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: bosch_shower_end_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: bosch_flow_all_l
+    type: float
+    restore_value: no
+    initial_value: '0'
+  - id: bosch_flow_shower_l
+    type: float
+    restore_value: no
+    initial_value: '0'
+  # The last shower: litres of water and gas, and minutes the shower ran.
+  - id: bosch_last_shower_water_l
+    type: float
+    restore_value: yes
+    initial_value: '0'
+  - id: bosch_last_shower_gas_l
+    type: float
+    restore_value: yes
+    initial_value: '0'
+  - id: bosch_last_shower_minutes
+    type: float
+    restore_value: yes
+    initial_value: '0'
+
+script:
+  # Builds and sends one PowerBus request. Queued with a gap after each send,
+  # so the heater only ever sees one request at a time.
+  - id: bosch_send
+    mode: queued
+    max_runs: 30
+    parameters:
+      cmd: int
+      payload: int[]
+    then:
+      - if:
+          condition:
+            lambda: 'return id(bosch_heater)->connected();'
+          then:
+            - ble_client.ble_write:
+                id: bosch_heater
+                service_uuid: ${bosch_service}
+                characteristic_uuid: ${bosch_char}
+                value: !lambda |-
+                  uint8_t msg_id = id(bosch_msg_id) & 0xFF;
+                  id(bosch_msg_id) = (id(bosch_msg_id) + 1) & 0xFF;
+                  ESP_LOGD("bosch", "TX cmd=%02X, %d data bytes", (int) cmd, (int) payload.size());
+                  return bosch_encode(msg_id, (uint8_t) cmd, payload);
+      - delay: 600ms
+
+  # Login step 2 (the PIN), sent once the heater answers step 1.
+  - id: bosch_login_pass
+    then:
+      - delay: 1s
+      - script.execute:
+          id: bosch_send
+          cmd: 162
+          payload: !lambda |-
+            std::vector<int> v{8};
+            for (char c : std::string("${bosch_pin}")) v.push_back(c - '0');
+            return v;
+
+  # Configuration and firmware: read once per connection.
+  - id: bosch_poll_static
+    then:
+      # 0xD2, location 6 (config): model, setpoint limit, country, capacity,
+      # unit, gas type - then appliance type
+      - script.execute:
+          id: bosch_send
+          cmd: 210
+          payload: !lambda 'return std::vector<int>{6, 0, 1, 2, 3, 4, 5};'
+      - script.execute:
+          id: bosch_send
+          cmd: 210
+          payload: !lambda 'return std::vector<int>{6, 21};'
+      # 0xD8 firmware version, main (1) and safety (2) processors
+      - script.execute:
+          id: bosch_send
+          cmd: 216
+          payload: !lambda 'return std::vector<int>{1};'
+      - script.execute:
+          id: bosch_send
+          cmd: 216
+          payload: !lambda 'return std::vector<int>{2};'
+
+  # Called by the device config when its shower starts / stops running.
+  # A restart within 2 minutes counts as the same shower.
+  - id: bosch_shower_started
+    then:
+      - lambda: |-
+          id(bosch_shower_running) = true;
+          id(bosch_shower_start_ms) = millis();
+          if (id(bosch_shower_end_ms) == 0 || millis() - id(bosch_shower_end_ms) > 120000) {
+            id(bosch_last_shower_water_l) = 0;
+            id(bosch_last_shower_gas_l) = 0;
+            id(bosch_last_shower_minutes) = 0;
+            ESP_LOGI("bosch", "Shower started");
+          }
+  - id: bosch_shower_stopped
+    mode: restart
+    then:
+      - lambda: |-
+          if (!id(bosch_shower_running)) return;
+          id(bosch_shower_running) = false;
+          id(bosch_shower_end_ms) = millis();
+          id(bosch_last_shower_minutes) += (millis() - id(bosch_shower_start_ms)) / 60000.0f;
+          id(hw_last_shower_duration).publish_state(roundf(id(bosch_last_shower_minutes)));
+      # Poll the recent uses soon after, rather than waiting up to 5 minutes.
+      - delay: 30s
+      - if:
+          condition:
+            lambda: 'return id(bosch_heater)->connected();'
+          then:
+            - script.execute: bosch_poll_dynamic
+
+  # Fault history, recent uses, lifetime counters: every 5 minutes.
+  - id: bosch_poll_dynamic
+    then:
+      - script.execute:
+          id: bosch_send
+          cmd: 215
+          payload: !lambda 'return std::vector<int>{10};'
+      - script.execute:
+          id: bosch_send
+          cmd: 176
+          payload: !lambda 'return std::vector<int>{3};'
+      - script.execute:
+          id: bosch_send
+          cmd: 176
+          payload: !lambda 'return std::vector<int>{2};'
+
+interval:
+  - interval: 5min
+    then:
+      - if:
+          condition:
+            lambda: 'return id(bosch_heater)->connected();'
+          then:
+            - script.execute: bosch_poll_dynamic
+  # Connection watchdog: the heater only accepts one BLE connection and stops
+  # advertising while it has one, so if anything else is connected (another
+  # ESP32, or the Bosch app) we'd otherwise just wait silently.
+  # It also drops a connection that has gone silent (the heater broadcasts
+  # every ~4 s once logged in), so we can never hold the heater hostage.
+  - interval: 30s
+    then:
+      - lambda: |-
+          static int ticks_disconnected = 0;
+          if (!id(bosch_heater)->connected()) {
+            // Warn after 30 s, then only every 10 minutes (e.g. while the app is in use).
+            if (ticks_disconnected++ % 20 == 0)
+              ESP_LOGW("bosch", "Not connected to heater - waiting for it to advertise. "
+                                "If this persists, make sure nothing else (another ESP32 or "
+                                "the Bosch app) is connected to it, and that it's in range.");
+            return;
+          }
+          ticks_disconnected = 0;
+          if (millis() - id(bosch_last_rx) > 60000) {
+            ESP_LOGW("bosch", "No data from heater for over 60 s - disconnecting to retry");
+            id(bosch_heater)->disconnect();
+          }
+
+sensor:
+  # ---------------------------------------------------------------------------
+  # Receiver (internal). Every message from the heater arrives here, is
+  # decoded, and routed to the entities below. update_interval: never stops
+  # ESPHome trying to *read* the characteristic every 60 s, which the heater
+  # doesn't allow (that was the "status=2" warning).
+  # ---------------------------------------------------------------------------
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: bosch_heater
+    id: bosch_rx
+    internal: true
+    service_uuid: ${bosch_service}
+    characteristic_uuid: ${bosch_char}
+    notify: true
+    update_interval: never
+    lambda: |-
+      static std::vector<uint8_t> buf;
+      // Remembered between messages, for change-only event logging.
+      static int last_sp = -1;
+      static bool was_running = false;
+      static uint8_t last_fault = 0;
+      static bool was_locked = false;
+      static std::string last_history;
+
+      // Publish helpers: only publish when the value actually changes.
+      auto pub = [](sensor::Sensor *s, float v) {
+        if (!s->has_state() || s->state != v) s->publish_state(v);
+      };
+      auto pubt = [](text_sensor::TextSensor *s, const std::string &v) {
+        if (!s->has_state() || s->state != v) s->publish_state(v);
+      };
+      auto pubb = [](binary_sensor::BinarySensor *s, bool v) {
+        if (!s->has_state() || s->state != v) s->publish_state(v);
+      };
+
+      // Reassemble, decode and verify one frame (see components/bosch_optiflow/bosch_optiflow.h).
+      std::vector<uint8_t> body;
+      switch (bosch_receive(x, buf, body)) {
+        case BOSCH_RX_INCOMPLETE:
+          return NAN;
+        case BOSCH_RX_BAD_CHECKSUM:
+          ESP_LOGW("bosch", "Corrupt message from heater (bad checksum): %s", bosch_hex(body).c_str());
+          return NAN;
+        case BOSCH_RX_OK:
+          break;
+      }
+      // Raw frames at DEBUG level only (compiled out at INFO, so the hex
+      // string is never built in normal use).
+      ESP_LOGD("bosch", "RX %s", bosch_hex(body).c_str());
+      id(bosch_last_rx) = millis();
+
+      // Route by command. d = the data bytes after the command byte.
+      uint8_t cmd = body[3];
+      std::vector<uint8_t> d(body.begin() + 4, body.end() - 1);
+      // Login replies come from the login handler (0xAB): [step, status].
+      if (cmd == 0xA2 && body[0] == 0xAB && d.size() >= 2) {
+        if (d[0] == 7 && (d[1] == 1 || d[1] == 2)) {
+          ESP_LOGD("bosch", "Login step 1 accepted - sending PIN");
+          id(bosch_login_pass).execute();
+        } else if (d[0] == 8 && d[1] == 1) {
+          ESP_LOGI("bosch", "Logged in to heater");
+          id(bosch_poll_static).execute();
+          id(bosch_poll_dynamic).execute();
+        } else {
+          ESP_LOGW("bosch", "Heater rejected the login (step %d, status %d)%s", d[0], d[1],
+                   d[0] == 8 ? " - check the PIN" : "");
+        }
+        return NAN;
+      }
+      if (body[0] != 0x00) return NAN;  // otherwise only interested in the heater
+
+      if (cmd == 0xA0) {
+        // Live status broadcast (34-byte "type 1" layout on this heater).
+        if (d.size() != 34 || d[0] != 1) {
+          ESP_LOGW("bosch", "Unexpected status message layout (length %d) - ignored", (int) d.size());
+          return NAN;
+        }
+        // Target temperature.
+        if (d[5] != last_sp) {
+          if (last_sp < 0) ESP_LOGI("bosch", "Target temperature is %d °C", d[5]);
+          else ESP_LOGI("bosch", "Target temperature changed: %d -> %d °C", last_sp, d[5]);
+          last_sp = d[5];
+        }
+        pub(id(hw_target_temp), d[5]);
+        if (!id(hw_setpoint_control).has_state() || id(hw_setpoint_control).state != d[5])
+          id(hw_setpoint_control).publish_state(d[5]);
+        // Water in use.
+        bool running = d[8] > 0;
+        if (running != was_running) {
+          if (running) ESP_LOGI("bosch", "Hot water on (%.1f L/min)", d[8] / 10.0f);
+          else ESP_LOGI("bosch", "Hot water off");
+          was_running = running;
+        }
+        pubb(id(hw_running), running);
+        pub(id(hw_flow), d[8] / 10.0f);
+        // Integrate hot water flow (L/min, broadcast every ~4 s) for shower
+        // attribution. Gaps over 30 s (e.g. reconnects) are capped.
+        static uint32_t last_status_ms = 0;
+        static float last_flow = 0;
+        uint32_t now = millis();
+        if (last_status_ms != 0) {
+          float litres = last_flow * std::min((now - last_status_ms) / 1000.0f, 30.0f) / 60.0f;
+          id(bosch_flow_all_l) += litres;
+          if (id(bosch_shower_running)) id(bosch_flow_shower_l) += litres;
+        }
+        last_status_ms = now;
+        last_flow = d[8] / 10.0f;
+        pub(id(hw_inlet_temp), d[1] + d[2] / 100.0f);
+        pub(id(hw_outlet_temp), d[28] + d[29] / 100.0f);
+        pub(id(hw_heat_exchanger_temp), d[3] + d[4] / 100.0f);
+        pub(id(hw_cabinet_temp), d[6] + d[7] / 100.0f);
+        pub(id(hw_burner_power), d[9]);
+        pub(id(hw_fan_power), d[12]);
+        pub(id(hw_fan_speed), d[13]);
+        pub(id(hw_air_flow), d[16] + d[17] / 100.0f);
+        pub(id(hw_air_setpoint), d[18] + d[19] / 100.0f);
+        pub(id(hw_gas_setpoint), d[22] + d[23] / 100.0f);
+        pubb(id(hw_flame), (d[10] & 0x10) != 0);
+        pubt(id(hw_operation_mode), "Mode " + std::to_string(d[32] + 1));
+        // Active fault.
+        if (d[11] != last_fault) {
+          if (d[11]) ESP_LOGW("bosch", "Heater fault %s", bosch_fault_text(d[11]).c_str());
+          else ESP_LOGI("bosch", "Heater fault cleared");
+          last_fault = d[11];
+        }
+        pubb(id(hw_fault_active), d[11] != 0);
+        pubt(id(hw_active_fault), bosch_fault_text(d[11]));
+        // Bathroom controller in use -> setpoint locked.
+        bool locked = (d[33] & 0x80) != 0;
+        if (locked != was_locked) {
+          ESP_LOGI("bosch", "Bathroom controller %s", locked ? "active - setpoint locked" : "released");
+          was_locked = locked;
+        }
+        pubb(id(hw_bathroom_ctrl), locked);
+
+      } else if (cmd == 0xD2) {
+        // Parameter read reply: [param, value_hi, value_lo] per parameter.
+        for (size_t i = 0; i + 2 < d.size(); i += 3) {
+          uint8_t p = d[i];
+          int v = (d[i + 1] << 8) | d[i + 2];
+          std::string unk = "Unknown (" + std::to_string(v) + ")";
+          switch (p) {
+            case 0: pubt(id(hw_cfg_model), v == 0 ? "Indoor" : v == 1 ? "Outdoor" : unk); break;
+            case 1: pubt(id(hw_cfg_setpoint_type), v == 0 ? "Normal" : v == 1 ? "Limited to 50 °C" : unk); break;
+            case 2: {
+              static const char *CV[7] = {"Europe", "Australia", "LN USA", "LN Europe",
+                                          "DNA Europe", "Australia (AUS_HAPPY)", "USA"};
+              pubt(id(hw_cfg_country), v < 7 ? CV[v] : unk);
+              break;
+            }
+            case 3: {
+              static const char *PW[3] = {"12 L/min", "15 or 16 L/min", "18 or 20 L/min"};
+              pubt(id(hw_cfg_power), v < 3 ? PW[v] : unk);
+              break;
+            }
+            case 4: pubt(id(hw_cfg_unit), v == 0 ? "°C" : v == 1 ? "°F" : unk); break;
+            case 5: {
+              static const char *GT[5] = {"G20 (natural gas)", "G30 (butane)", "G31 (propane / LPG)",
+                                          "G25 (natural gas L)", "G20 1.8mm (natural gas)"};
+              id(bosch_gas_type) = v;
+              pubt(id(hw_cfg_gas_type), v < 5 ? GT[v] : unk);
+              break;
+            }
+            case 21: pubt(id(hw_cfg_appliance_type), v == 0 ? "Residential" : v == 1 ? "Commercial" : unk); break;
+          }
+        }
+
+      } else if (cmd == 0xD7) {
+        // Fault history, most recent first.
+        std::string hist;
+        for (size_t i = 0; i < d.size(); i++) hist += (i ? ", " : "") + bosch_hex2(d[i]);
+        if (hist.empty()) hist = "None";
+        if (!last_history.empty() && hist != last_history && !d.empty())
+          ESP_LOGW("bosch", "New fault recorded: %s", bosch_fault_text(d[0]).c_str());
+        last_history = hist;
+        pubt(id(hw_fault_history), hist);
+        pubt(id(hw_last_fault), d.empty() ? "None" : bosch_fault_text(d[0]));
+
+      } else if (cmd == 0xB0 && !d.empty() && d[0] == 3) {
+        // Last hot water uses, most recent first. From d[2], 6 bytes each:
+        // gas (litres of gas vapour), water (litres), duration (minutes).
+        // Gas energy uses the app's kWh-per-m3 figure for the gas type.
+        static const float KWH_PER_M3[5] = {9.45f, 27.86f, 24.44f, 8.12f, 8.12f};
+        int gt = id(bosch_gas_type);
+        std::vector<uint64_t> uses;
+        std::string summary;
+        for (size_t i = 2; i + 5 < d.size(); i += 6) {
+          uint16_t gas = (d[i] << 8) | d[i + 1];
+          uint16_t water = (d[i + 2] << 8) | d[i + 3];
+          uint16_t dur = (d[i + 4] << 8) | d[i + 5];
+          if (uses.empty()) {
+            pub(id(hw_last_use_water), water);
+            pub(id(hw_last_use_duration), dur);
+            if (gt >= 0 && gt < 5) pub(id(hw_last_use_gas), gas * KWH_PER_M3[gt] / 1000.0f * 3.6f);
+          }
+          char tmp[40];
+          snprintf(tmp, sizeof(tmp), "%s%d L / %d min", uses.empty() ? "" : ", ", water, dur);
+          summary += tmp;
+          uses.push_back(bosch_use_key(gas, water, dur));
+        }
+        pubt(id(hw_recent_uses), uses.empty() ? "None" : summary);
+
+        // Add what's new since the previous list to the running totals. After a
+        // reboot, compare with the newest uses saved before it.
+        static std::vector<uint64_t> prev_uses;
+        if (prev_uses.empty()) {
+          const uint64_t saved[3] = {id(bosch_saved_use_0), id(bosch_saved_use_1), id(bosch_saved_use_2)};
+          prev_uses.assign(saved, saved + std::min(id(bosch_saved_use_count), 3));
+        }
+        float new_gas = 0, new_water = 0;
+        if (bosch_count_new_uses(uses, prev_uses, new_gas, new_water)) {
+          id(bosch_total_gas_l) += new_gas;
+          id(bosch_total_water_l) += new_water;
+          if (new_water > 0 || new_gas > 0) {
+            // Shower's share: flow while the shower ran / all flow since the
+            // last count. If no flow was seen (heater updated its figures
+            // late), use the share from last time.
+            static float shower_share = 0;
+            if (id(bosch_flow_all_l) > 0.5f) shower_share = std::min(id(bosch_flow_shower_l) / id(bosch_flow_all_l), 1.0f);
+            id(bosch_last_shower_water_l) += new_water * shower_share;
+            id(bosch_last_shower_gas_l) += new_gas * shower_share;
+            ESP_LOGI("bosch", "Hot water use: +%.0f L water, +%.0f L gas (%.0f%% shower)", new_water, new_gas,
+                     shower_share * 100);
+          }
+          id(bosch_flow_all_l) = 0;
+          id(bosch_flow_shower_l) = 0;
+        } else {
+          ESP_LOGW("bosch", "Recent uses list changed unexpectedly - not counted: %s", summary.c_str());
+        }
+        prev_uses = uses;
+        id(bosch_saved_use_count) = std::min<int>(uses.size(), 3);
+        if (uses.size() > 0) id(bosch_saved_use_0) = uses[0];
+        if (uses.size() > 1) id(bosch_saved_use_1) = uses[1];
+        if (uses.size() > 2) id(bosch_saved_use_2) = uses[2];
+        pub(id(hw_total_water), id(bosch_total_water_l));
+        pub(id(hw_last_shower_water), roundf(id(bosch_last_shower_water_l)));
+        pub(id(hw_last_shower_duration), roundf(id(bosch_last_shower_minutes)));
+        if (gt >= 0 && gt < 5) pub(id(hw_last_shower_gas), id(bosch_last_shower_gas_l) * KWH_PER_M3[gt] / 1000.0f * 3.6f);
+        if (gt >= 0 && gt < 5) pub(id(hw_total_gas), id(bosch_total_gas_l) * KWH_PER_M3[gt] / 1000.0f * 3.6f);
+
+      } else if (cmd == 0xB0 && d.size() >= 7 && d[0] == 2) {
+        // Lifetime counters: cycles = d[1..4], operating minutes = d[6..end].
+        uint32_t cycles = ((uint32_t) d[1] << 24) | (d[2] << 16) | (d[3] << 8) | d[4];
+        uint32_t minutes = 0;
+        for (size_t i = 6; i < d.size(); i++) minutes = (minutes << 8) | d[i];
+        pub(id(hw_cycles), cycles);
+        pub(id(hw_hours), minutes / 60.0f);
+
+      } else if (cmd == 0xD8 && d.size() >= 4) {
+        // Firmware, e.g. "FPAF5127" (FPA = main CPU, FPB = safety CPU).
+        std::string v = std::string(d[0] == 1 ? "FPA" : "FPB") + (d[1] == 0 ? "L" : "F") + bosch_hex2(d[2]) + bosch_hex2(d[3]);
+        pubt(d[0] == 1 ? id(hw_fw_main) : id(hw_fw_safety), v);
+
+      } else if (cmd == 0xD3 && d.size() >= 2 && d[1] != 1) {
+        ESP_LOGW("bosch", "Heater rejected the temperature change (status %d)", d[1]);
+
+      }
+      return NAN;
+
+  # --- Live values from the status broadcast (every ~4 s) --------------------
+  - platform: template
+    id: hw_target_temp
+    name: "Hot Water Target Temperature"
+    icon: "mdi:thermometer-water"
+    device_class: temperature
+    state_class: measurement
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+  - platform: template
+    id: hw_inlet_temp
+    name: "Hot Water Inlet Temperature"
+    icon: "mdi:thermometer-water"
+    device_class: temperature
+    state_class: measurement
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+  - platform: template
+    id: hw_outlet_temp
+    name: "Hot Water Outlet Temperature"
+    icon: "mdi:thermometer-water"
+    device_class: temperature
+    state_class: measurement
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+  - platform: template
+    id: hw_flow
+    name: "Hot Water Flow"
+    icon: "mdi:water-pump"
+    device_class: volume_flow_rate
+    state_class: measurement
+    unit_of_measurement: "L/min"
+    accuracy_decimals: 1
+  - platform: template
+    id: hw_heat_exchanger_temp
+    name: "Hot Water Heat Exchanger Temperature"
+    device_class: temperature
+    state_class: measurement
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    entity_category: diagnostic
+  - platform: template
+    id: hw_cabinet_temp
+    name: "Hot Water Cabinet Temperature"
+    device_class: temperature
+    state_class: measurement
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    entity_category: diagnostic
+  # Units for burner/fan/air/gas values aren't stated in the app; these are
+  # the raw numbers it displays.
+  - platform: template
+    id: hw_burner_power
+    name: "Hot Water Burner Power"
+    icon: "mdi:fire"
+    state_class: measurement
+    entity_category: diagnostic
+  - platform: template
+    id: hw_fan_power
+    name: "Hot Water Fan Power"
+    icon: "mdi:fan"
+    state_class: measurement
+    entity_category: diagnostic
+  - platform: template
+    id: hw_fan_speed
+    name: "Hot Water Fan Speed"
+    icon: "mdi:fan"
+    state_class: measurement
+    entity_category: diagnostic
+  - platform: template
+    id: hw_air_flow
+    name: "Hot Water Air Flow"
+    icon: "mdi:weather-windy"
+    state_class: measurement
+    accuracy_decimals: 2
+    entity_category: diagnostic
+  - platform: template
+    id: hw_air_setpoint
+    name: "Hot Water Air Setpoint"
+    icon: "mdi:weather-windy"
+    state_class: measurement
+    accuracy_decimals: 2
+    entity_category: diagnostic
+  - platform: template
+    id: hw_gas_setpoint
+    name: "Hot Water Gas Setpoint"
+    icon: "mdi:gas-burner"
+    state_class: measurement
+    accuracy_decimals: 2
+    entity_category: diagnostic
+
+  # --- Most recent hot water use (every 5 min) --------------------------------
+  - platform: template
+    id: hw_last_use_water
+    name: "Hot Water Last Use Water"
+    icon: "mdi:water"
+    state_class: measurement
+    unit_of_measurement: "L"
+  - platform: template
+    id: hw_last_use_gas
+    name: "Hot Water Last Use Gas"
+    icon: "mdi:meter-gas"
+    state_class: measurement
+    unit_of_measurement: "MJ"
+    accuracy_decimals: 2
+  - platform: template
+    id: hw_last_use_duration
+    name: "Hot Water Last Use Duration"
+    icon: "mdi:timer-outline"
+    device_class: duration
+    state_class: measurement
+    unit_of_measurement: "min"
+
+  # --- The last shower (only hot water used while the shower ran) -------------
+  - platform: template
+    id: hw_last_shower_water
+    name: "Last Shower Water"
+    icon: "mdi:shower-head"
+    state_class: measurement
+    unit_of_measurement: "L"
+    accuracy_decimals: 0
+  - platform: template
+    id: hw_last_shower_gas
+    name: "Last Shower Gas"
+    icon: "mdi:meter-gas"
+    state_class: measurement
+    unit_of_measurement: "MJ"
+    accuracy_decimals: 2
+  - platform: template
+    id: hw_last_shower_duration
+    name: "Last Shower Duration"
+    icon: "mdi:timer-outline"
+    device_class: duration
+    state_class: measurement
+    unit_of_measurement: "min"
+    accuracy_decimals: 0
+
+  # --- Running totals for the Energy dashboard (every 5 min) -------------------
+  # Built from the uses above, counted on this ESP32 since 2026-09-28.
+  - platform: template
+    id: hw_total_water
+    name: "Hot Water Total Volume"
+    icon: "mdi:water"
+    device_class: water
+    state_class: total_increasing
+    unit_of_measurement: "L"
+    accuracy_decimals: 0
+  - platform: template
+    id: hw_total_gas
+    name: "Hot Water Total Gas"
+    icon: "mdi:meter-gas"
+    device_class: energy
+    state_class: total_increasing
+    unit_of_measurement: "MJ"
+    accuracy_decimals: 2
+
+  # --- Lifetime counters (every 5 min) ----------------------------------------
+  - platform: template
+    id: hw_hours
+    name: "Hot Water Operating Hours"
+    icon: "mdi:clock-outline"
+    device_class: duration
+    state_class: total_increasing
+    unit_of_measurement: "h"
+    accuracy_decimals: 1
+    entity_category: diagnostic
+  - platform: template
+    id: hw_cycles
+    name: "Hot Water Operating Cycles"
+    icon: "mdi:counter"
+    state_class: total_increasing
+    entity_category: diagnostic
+
+binary_sensor:
+  - platform: template
+    id: hw_running
+    name: "Hot Water Running"
+    icon: "mdi:water-boiler"
+    device_class: running
+  - platform: template
+    id: hw_fault_active
+    name: "Hot Water Fault"
+    device_class: problem
+  # On while a bathroom controller is in use - the setpoint can't be changed
+  # from here (or the app) until it clears.
+  - platform: template
+    id: hw_bathroom_ctrl
+    name: "Hot Water Bathroom Controller Active"
+    icon: "mdi:lock-outline"
+  - platform: template
+    id: hw_flame
+    name: "Hot Water Flame"
+    icon: "mdi:fire"
+    entity_category: diagnostic
+
+text_sensor:
+  - platform: template
+    id: hw_active_fault
+    name: "Hot Water Active Fault"
+    icon: "mdi:alert-circle-outline"
+  - platform: template
+    id: hw_last_fault
+    name: "Hot Water Last Fault"
+    icon: "mdi:history"
+  - platform: template
+    id: hw_fault_history
+    name: "Hot Water Fault History"
+    icon: "mdi:format-list-bulleted"
+  - platform: template
+    id: hw_recent_uses
+    name: "Hot Water Recent Uses"
+    icon: "mdi:format-list-bulleted"
+  - platform: template
+    id: hw_operation_mode
+    name: "Hot Water Operation Mode"
+    icon: "mdi:cog"
+    entity_category: diagnostic
+  - platform: template
+    id: hw_cfg_gas_type
+    name: "Hot Water Gas Type"
+    icon: "mdi:gas-cylinder"
+    entity_category: diagnostic
+  - platform: template
+    id: hw_cfg_country
+    name: "Hot Water Country Variant"
+    icon: "mdi:earth"
+    entity_category: diagnostic
+  - platform: template
+    id: hw_cfg_power
+    name: "Hot Water Capacity"
+    icon: "mdi:water-boiler"
+    entity_category: diagnostic
+  - platform: template
+    id: hw_cfg_model
+    name: "Hot Water Installation"
+    icon: "mdi:home-outline"
+    entity_category: diagnostic
+  - platform: template
+    id: hw_cfg_appliance_type
+    name: "Hot Water Appliance Type"
+    icon: "mdi:information-outline"
+    entity_category: diagnostic
+  - platform: template
+    id: hw_cfg_setpoint_type
+    name: "Hot Water Setpoint Limit"
+    icon: "mdi:lock-outline"
+    entity_category: diagnostic
+  - platform: template
+    id: hw_cfg_unit
+    name: "Hot Water Temperature Unit"
+    icon: "mdi:temperature-celsius"
+    entity_category: diagnostic
+  - platform: template
+    id: hw_fw_main
+    name: "Hot Water Firmware (main)"
+    icon: "mdi:chip"
+    entity_category: diagnostic
+  - platform: template
+    id: hw_fw_safety
+    name: "Hot Water Firmware (safety)"
+    icon: "mdi:chip"
+    entity_category: diagnostic
+
+button:
+  # Disconnect from the heater and stop auto-reconnecting (e.g. to let the
+  # Bosch app take over, or to free the heater's single BLE slot temporarily).
+  - platform: template
+    name: "Hot Water Disconnect"
+    icon: "mdi:bluetooth-off"
+    entity_category: config
+    on_press:
+      - lambda: |-
+          ESP_LOGI("bosch", "Disconnect requested - disabling auto-connect");
+          id(bosch_heater)->set_enabled(false);
+          id(bosch_heater)->disconnect();
+
+  # Re-enable auto-connect after a manual disconnect. The heater's BLE stack
+  # needs a moment to register the previous disconnection before it will
+  # advertise again, so there is a short delay before the connect attempt.
+  - platform: template
+    name: "Hot Water Reconnect"
+    icon: "mdi:bluetooth-connect"
+    entity_category: config
+    on_press:
+      - lambda: |-
+          ESP_LOGI("bosch", "Reconnect requested - re-enabling auto-connect");
+          id(bosch_heater)->set_enabled(true);
+
+number:
+  # Sets the target temperature (37-50 °C). Its displayed value is pushed
+  # from the heater's own broadcasts, so it also follows the wired controller.
+  - platform: template
+    id: hw_setpoint_control
+    name: "Hot Water Set Temperature"
+    icon: "mdi:thermometer-plus"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    min_value: 37
+    max_value: 50
+    step: 1
+    mode: slider
+    set_action:
+      - if:
+          # Same rule as the app: no changes while a bathroom controller
+          # owns the setpoint.
+          condition:
+            binary_sensor.is_on: hw_bathroom_ctrl
+          then:
+            - logger.log:
+                level: WARN
+                tag: bosch
+                format: "Can't change temperature - bathroom controller active"
+            - lambda: |-
+                if (id(hw_target_temp).has_state())
+                  id(hw_setpoint_control).publish_state(id(hw_target_temp).state);
+          else:
+            # 0xD3 write param: location 2, param 0x55 (setpoint), 16-bit value
+            - script.execute:
+                id: bosch_send
+                cmd: 211
+                payload: !lambda |-
+                  int t = (int) lroundf(x);
+                  if (t < 37) t = 37;
+                  if (t > 50) t = 50;
+                  ESP_LOGI("bosch", "Requesting target temperature %d °C", t);
+                  return std::vector<int>{2, 0x55, 0, t};

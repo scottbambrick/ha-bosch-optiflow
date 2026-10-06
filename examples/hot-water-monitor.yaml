@@ -1,0 +1,44 @@
+# Minimal ESPHome device for a Bosch Optiflow heater. Optionally add a flow
+# meter / switch that calls bosch_shower_started / bosch_shower_stopped to get
+# the "Last Shower" sensors (see README).
+substitutions:
+  name: hot-water-monitor
+  friendly_name: Hot Water Monitor
+  bosch_mac: "AA:BB:CC:DD:EE:FF"  # your heater's Bluetooth address
+  bosch_pin: "123456"             # the pairing PIN printed on the heater
+
+packages:
+  bosch: github://scottbambrick/ha-bosch-optiflow/packages/bosch-optiflow.yaml@main
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+# Optional: count a shower while a flow meter / occupancy sensor is on.
+# binary_sensor:
+#   - platform: gpio
+#     pin: GPIO25
+#     name: "Shower Occupied"
+#     on_press:
+#       - script.execute: bosch_shower_started
+#     on_release:
+#       - script.execute: bosch_shower_stopped
