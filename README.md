@@ -1,10 +1,16 @@
 # ha-bosch-optiflow
 
-An ESPHome package that reads a **Bosch Optiflow** instantaneous hot water heater over Bluetooth LE and exposes it to Home Assistant: temperatures, flow, burner/fan power, flame, faults, operating hours, per-use and lifetime water and gas volumes, plus setting the target temperature.
+An ESPHome package that reads a **Bosch Optiflow** instantaneous hot water heater **with a Bluetooth adapter** over Bluetooth LE and exposes it to Home Assistant: temperatures, flow, burner/fan power, flame, faults, operating hours, per-use and lifetime water and gas volumes, plus setting the target temperature.
 
 It talks the heater's "PowerBus" protocol over BLE, which I reverse-engineered by watching what the official app does. Nothing here is endorsed by or affiliated with Bosch. **Use at your own risk**: it only sends the reads the official app sends, plus the setpoint write, but it is unofficial.
 
-Tested on a single LPG unit, with an ESP32 running ESPHome 2026.9 (esp-idf framework). Other Optiflow models or firmware may behave differently; issues and PRs welcome.
+## Compatibility
+
+- Applies to Bosch Optiflow hot water units that have a **Bluetooth adapter** (the one the official Bosch app connects to). Units without it can't be used.
+- **Confirmed only with models sold in Australia.** Models sold in other countries may use different parameters or firmware and are untested; the heater reports a country variant, which this package exposes. Reports from other regions are welcome.
+- Tested on a single LPG unit, with an ESP32 running ESPHome 2026.9 (esp-idf framework).
+
+Issues and PRs welcome.
 
 ## Install
 
