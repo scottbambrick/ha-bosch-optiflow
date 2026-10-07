@@ -29,7 +29,7 @@ Binary sensors: running, flame, fault, bathroom controller active.
 Text sensors: active/last fault, fault history, recent uses, operation mode, gas type, country variant, capacity, installation, appliance type, setpoint limit, unit, firmware (main and safety).
 Controls: set temperature, disconnect, reconnect.
 
-The two volume totals are counted from the heater's own use history, so they keep running across reboots and are suitable for the Energy dashboard.
+The two volume totals are counted from the heater's own use history, so they keep running across reboots and are suitable for the Energy dashboard. A use list that arrives corrupted over BLE (a use of over 1500 L or 12 hours) is ignored rather than counted.
 
 ### "Last Shower" sensors (optional)
 

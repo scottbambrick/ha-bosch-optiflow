@@ -156,6 +156,15 @@ inline uint16_t bosch_use_gas(uint64_t key) { return (key >> 32) & 0xFFFF; }
 inline uint16_t bosch_use_water(uint64_t key) { return (key >> 16) & 0xFFFF; }
 inline uint16_t bosch_use_minutes(uint64_t key) { return key & 0xFFFF; }
 
+// A list read from the heater can be corrupted (2026-10-07: "103 L / 3328 min, 21760 L / 2816
+// min" - the real "103 L / 13 min" shifted by a byte), and it still lined up with the previous
+// list and added ~48,000 L. A real use is under a few hundred litres and a few hours.
+inline bool bosch_list_plausible(const std::vector<uint64_t> &uses) {
+  for (uint64_t u : uses)
+    if (bosch_use_water(u) > 1500 || bosch_use_minutes(u) > 720) return false;
+  return true;
+}
+
 // True if `now` is `before`, or `before` after it grew (use still running).
 inline bool bosch_use_grew(uint64_t now, uint64_t before) {
   return bosch_use_gas(now) >= bosch_use_gas(before) && bosch_use_water(now) >= bosch_use_water(before) &&

@@ -543,8 +543,12 @@ sensor:
         pubt(id(hw_recent_uses), uses.empty() ? "None" : summary);
 
         // Add what's new since the previous list to the running totals. After a
-        // reboot, compare with the newest uses saved before it.
+        // reboot, compare with the newest uses saved before it. A corrupted list
+        // is ignored entirely (neither counted nor remembered).
         static std::vector<uint64_t> prev_uses;
+        if (!bosch_list_plausible(uses)) {
+          ESP_LOGW("bosch", "Recent uses list looks corrupted - ignored: %s", summary.c_str());
+        } else {
         if (prev_uses.empty()) {
           const uint64_t saved[3] = {id(bosch_saved_use_0), id(bosch_saved_use_1), id(bosch_saved_use_2)};
           prev_uses.assign(saved, saved + std::min(id(bosch_saved_use_count), 3));
@@ -579,6 +583,7 @@ sensor:
         pub(id(hw_last_shower_duration), roundf(id(bosch_last_shower_minutes)));
         if (gt >= 0 && gt < 5) pub(id(hw_last_shower_gas), id(bosch_last_shower_gas_l) * KWH_PER_M3[gt] / 1000.0f * 3.6f);
         if (gt >= 0 && gt < 5) pub(id(hw_total_gas), id(bosch_total_gas_l) * KWH_PER_M3[gt] / 1000.0f * 3.6f);
+        }
 
       } else if (cmd == 0xB0 && d.size() >= 7 && d[0] == 2) {
         // Lifetime counters: cycles = d[1..4], operating minutes = d[6..end].
