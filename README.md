@@ -20,7 +20,15 @@ Issues and PRs welcome.
 
 The heater accepts **one BLE connection at a time**, and stops advertising while it has one. Close the Bosch app and make sure no other ESP32 is connected to it.
 
-The package pulls the C++ helpers from this repo as an ESPHome external component; pin it with `bosch_ref: v1.0.0` in `substitutions` if you want to avoid `main` changing underneath you.
+The package pulls the C++ helpers from this repo as an ESPHome external component. To avoid `main` changing
+underneath you, pin both to a [release](https://github.com/scottbambrick/ha-bosch-optiflow/releases):
+
+```yaml
+substitutions:
+  bosch_ref: v1.0.0          # the C++ helpers
+packages:
+  bosch: github://scottbambrick/ha-bosch-optiflow/packages/bosch-optiflow.yaml@v1.0.0
+```
 
 ## Entities
 
