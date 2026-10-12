@@ -549,40 +549,40 @@ sensor:
         if (!bosch_list_plausible(uses)) {
           ESP_LOGW("bosch", "Recent uses list looks corrupted - ignored: %s", summary.c_str());
         } else {
-        if (prev_uses.empty()) {
-          const uint64_t saved[3] = {id(bosch_saved_use_0), id(bosch_saved_use_1), id(bosch_saved_use_2)};
-          prev_uses.assign(saved, saved + std::min(id(bosch_saved_use_count), 3));
-        }
-        float new_gas = 0, new_water = 0;
-        if (bosch_count_new_uses(uses, prev_uses, new_gas, new_water)) {
-          id(bosch_total_gas_l) += new_gas;
-          id(bosch_total_water_l) += new_water;
-          if (new_water > 0 || new_gas > 0) {
-            // Shower's share: flow while the shower ran / all flow since the
-            // last count. If no flow was seen (heater updated its figures
-            // late), use the share from last time.
-            static float shower_share = 0;
-            if (id(bosch_flow_all_l) > 0.5f) shower_share = std::min(id(bosch_flow_shower_l) / id(bosch_flow_all_l), 1.0f);
-            id(bosch_last_shower_water_l) += new_water * shower_share;
-            id(bosch_last_shower_gas_l) += new_gas * shower_share;
-            ESP_LOGI("bosch", "Hot water use: +%.0f L water, +%.0f L gas (%.0f%% shower)", new_water, new_gas,
-                     shower_share * 100);
+          if (prev_uses.empty()) {
+            const uint64_t saved[3] = {id(bosch_saved_use_0), id(bosch_saved_use_1), id(bosch_saved_use_2)};
+            prev_uses.assign(saved, saved + std::min(id(bosch_saved_use_count), 3));
           }
-          id(bosch_flow_all_l) = 0;
-          id(bosch_flow_shower_l) = 0;
-        } else {
-          ESP_LOGW("bosch", "Recent uses list changed unexpectedly - not counted: %s", summary.c_str());
-        }
-        prev_uses = uses;
-        id(bosch_saved_use_count) = std::min<int>(uses.size(), 3);
-        if (uses.size() > 0) id(bosch_saved_use_0) = uses[0];
-        if (uses.size() > 1) id(bosch_saved_use_1) = uses[1];
-        if (uses.size() > 2) id(bosch_saved_use_2) = uses[2];
-        pub(id(hw_total_water), id(bosch_total_water_l));
-        pub(id(hw_last_shower_water), roundf(id(bosch_last_shower_water_l)));
-        pub(id(hw_last_shower_duration), roundf(id(bosch_last_shower_minutes)));
-        if (gt >= 0 && gt < 5) pub(id(hw_last_shower_gas), id(bosch_last_shower_gas_l) * KWH_PER_M3[gt] / 1000.0f * 3.6f);
-        if (gt >= 0 && gt < 5) pub(id(hw_total_gas), id(bosch_total_gas_l) * KWH_PER_M3[gt] / 1000.0f * 3.6f);
+          float new_gas = 0, new_water = 0;
+          if (bosch_count_new_uses(uses, prev_uses, new_gas, new_water)) {
+            id(bosch_total_gas_l) += new_gas;
+            id(bosch_total_water_l) += new_water;
+            if (new_water > 0 || new_gas > 0) {
+              // Shower's share: flow while the shower ran / all flow since the
+              // last count. If no flow was seen (heater updated its figures
+              // late), use the share from last time.
+              static float shower_share = 0;
+              if (id(bosch_flow_all_l) > 0.5f) shower_share = std::min(id(bosch_flow_shower_l) / id(bosch_flow_all_l), 1.0f);
+              id(bosch_last_shower_water_l) += new_water * shower_share;
+              id(bosch_last_shower_gas_l) += new_gas * shower_share;
+              ESP_LOGI("bosch", "Hot water use: +%.0f L water, +%.0f L gas (%.0f%% shower)", new_water, new_gas,
+                       shower_share * 100);
+            }
+            id(bosch_flow_all_l) = 0;
+            id(bosch_flow_shower_l) = 0;
+          } else {
+            ESP_LOGW("bosch", "Recent uses list changed unexpectedly - not counted: %s", summary.c_str());
+          }
+          prev_uses = uses;
+          id(bosch_saved_use_count) = std::min<int>(uses.size(), 3);
+          if (uses.size() > 0) id(bosch_saved_use_0) = uses[0];
+          if (uses.size() > 1) id(bosch_saved_use_1) = uses[1];
+          if (uses.size() > 2) id(bosch_saved_use_2) = uses[2];
+          pub(id(hw_total_water), id(bosch_total_water_l));
+          pub(id(hw_last_shower_water), roundf(id(bosch_last_shower_water_l)));
+          pub(id(hw_last_shower_duration), roundf(id(bosch_last_shower_minutes)));
+          if (gt >= 0 && gt < 5) pub(id(hw_last_shower_gas), id(bosch_last_shower_gas_l) * KWH_PER_M3[gt] / 1000.0f * 3.6f);
+          if (gt >= 0 && gt < 5) pub(id(hw_total_gas), id(bosch_total_gas_l) * KWH_PER_M3[gt] / 1000.0f * 3.6f);
         }
 
       } else if (cmd == 0xB0 && d.size() >= 7 && d[0] == 2) {
