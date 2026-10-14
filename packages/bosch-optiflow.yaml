@@ -127,6 +127,12 @@ globals:
     type: int
     restore_value: no
     initial_value: '-1'
+  # True when the heater is set to Fahrenheit (the status setpoint is >= 100).
+  # Temperatures are converted to °C for Home Assistant.
+  - id: bosch_fahrenheit
+    type: bool
+    restore_value: no
+    initial_value: 'false'
   # millis() when we last heard anything from the heater (for the watchdog).
   - id: bosch_last_rx
     type: uint32_t
@@ -235,8 +241,15 @@ script:
           id: bosch_send
           cmd: 162
           payload: !lambda |-
+            // The app sends the 6-character code as nibble values 0-15, so
+            // a code with letters A-F is valid hex, not decimal.
             std::vector<int> v{8};
-            for (char c : std::string("${bosch_pin}")) v.push_back(c - '0');
+            for (char c : std::string("${bosch_pin}")) {
+              int n = (c >= '0' && c <= '9') ? c - '0'
+                    : (c >= 'a' && c <= 'f') ? c - 'a' + 10
+                    : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : 0xFF;
+              v.push_back(n);
+            }
             return v;
 
   # Configuration and firmware: read once per connection.
@@ -261,6 +274,40 @@ script:
           id: bosch_send
           cmd: 216
           payload: !lambda 'return std::vector<int>{2};'
+      # The app waits for each reply and retries. We fire and forget, so if a
+      # reply was lost, ask again (up to 3 times) while any of these is unset.
+      - repeat:
+          count: 3
+          then:
+            - delay: 15s
+            - if:
+                condition:
+                  lambda: |-
+                    return id(bosch_heater)->connected() &&
+                           !(id(hw_cfg_gas_type).has_state() && id(hw_cfg_unit).has_state() &&
+                             id(hw_cfg_appliance_type).has_state() && id(hw_fw_main).has_state() &&
+                             id(hw_fw_safety).has_state());
+                then:
+                  - logger.log:
+                      level: WARN
+                      tag: bosch
+                      format: "Some configuration replies are missing - asking again"
+                  - script.execute:
+                      id: bosch_send
+                      cmd: 210
+                      payload: !lambda 'return std::vector<int>{6, 0, 1, 2, 3, 4, 5};'
+                  - script.execute:
+                      id: bosch_send
+                      cmd: 210
+                      payload: !lambda 'return std::vector<int>{6, 21};'
+                  - script.execute:
+                      id: bosch_send
+                      cmd: 216
+                      payload: !lambda 'return std::vector<int>{1};'
+                  - script.execute:
+                      id: bosch_send
+                      cmd: 216
+                      payload: !lambda 'return std::vector<int>{2};'
 
   # Called by the device config when its shower starts / stops running.
   # A restart within 2 minutes counts as the same shower.
@@ -307,6 +354,11 @@ script:
           id: bosch_send
           cmd: 176
           payload: !lambda 'return std::vector<int>{2};'
+      # Exhaust gas temperature (config table, param 109).
+      - script.execute:
+          id: bosch_send
+          cmd: 210
+          payload: !lambda 'return std::vector<int>{6, 109};'
 
 interval:
   - interval: 5min
@@ -417,15 +469,21 @@ sensor:
           ESP_LOGW("bosch", "Unexpected status message layout (length %d) - ignored", (int) d.size());
           return NAN;
         }
+        // The app takes a setpoint of 100 or more to mean the heater is in °F.
+        bool f = d[5] >= 100;
+        if (f != id(bosch_fahrenheit)) ESP_LOGI("bosch", "Heater temperature unit: %s", f ? "°F" : "°C");
+        id(bosch_fahrenheit) = f;
+        auto tc = [f](float t) { return f ? (t - 32.0f) * 5.0f / 9.0f : t; };
         // Target temperature.
         if (d[5] != last_sp) {
           if (last_sp < 0) ESP_LOGI("bosch", "Target temperature is %d °C", d[5]);
           else ESP_LOGI("bosch", "Target temperature changed: %d -> %d °C", last_sp, d[5]);
           last_sp = d[5];
         }
-        pub(id(hw_target_temp), d[5]);
-        if (!id(hw_setpoint_control).has_state() || id(hw_setpoint_control).state != d[5])
-          id(hw_setpoint_control).publish_state(d[5]);
+        float target_c = roundf(tc(d[5]));
+        pub(id(hw_target_temp), target_c);
+        if (!id(hw_setpoint_control).has_state() || id(hw_setpoint_control).state != target_c)
+          id(hw_setpoint_control).publish_state(target_c);
         // Water in use.
         bool running = d[8] > 0;
         if (running != was_running) {
@@ -447,10 +505,10 @@ sensor:
         }
         last_status_ms = now;
         last_flow = d[8] / 10.0f;
-        pub(id(hw_inlet_temp), d[1] + d[2] / 100.0f);
-        pub(id(hw_outlet_temp), d[28] + d[29] / 100.0f);
-        pub(id(hw_heat_exchanger_temp), d[3] + d[4] / 100.0f);
-        pub(id(hw_cabinet_temp), d[6] + d[7] / 100.0f);
+        pub(id(hw_inlet_temp), tc(d[1] + d[2] / 100.0f));
+        pub(id(hw_outlet_temp), tc(d[28] + d[29] / 100.0f));
+        pub(id(hw_heat_exchanger_temp), tc(d[3] + d[4] / 100.0f));
+        pub(id(hw_cabinet_temp), tc(d[6] + d[7] / 100.0f));
         pub(id(hw_burner_power), d[9]);
         pub(id(hw_fan_power), d[12]);
         pub(id(hw_fan_speed), d[13]);
@@ -474,9 +532,31 @@ sensor:
           was_locked = locked;
         }
         pubb(id(hw_bathroom_ctrl), locked);
+        // Highest setpoint the heater allows (bits 0-6 of the same byte).
+        {
+          static const char *MAXSP[3] = {"55 °C", "60 °C", "70 °C"};
+          uint8_t m = d[33] & 0x7F;
+          pubt(id(hw_max_setpoint), m < 3 ? MAXSP[m] : "Unknown (" + std::to_string(m) + ")");
+        }
+        // Bytes whose meaning isn't known (or never seen non-zero): log
+        // them at DEBUG whenever one changes, to find out what they are.
+        {
+          static uint8_t last_raw[10] = {0};
+          static bool raw_seen = false;
+          const uint8_t raw[10] = {d[10], d[14], d[15], d[20], d[21], d[24], d[25], d[26], d[27], d[30]};
+          if (!raw_seen || memcmp(raw, last_raw, sizeof(raw)) != 0 || d[31] != 0) {
+            ESP_LOGD("bosch", "Status bytes d10=%02X d14=%02X d15=%02X d20=%02X d21=%02X d24=%02X "
+                              "d25(flue)=%02X d26=%02X d27(pressure)=%02X d30=%02X d31=%02X d32=%02X d33=%02X",
+                     raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8], raw[9],
+                     d[31], d[32], d[33]);
+            memcpy(last_raw, raw, sizeof(raw));
+            raw_seen = true;
+          }
+        }
 
       } else if (cmd == 0xD2) {
         // Parameter read reply: [param, value_hi, value_lo] per parameter.
+        auto tc_cfg = [&](float t) { return id(bosch_fahrenheit) ? (t - 32.0f) * 5.0f / 9.0f : t; };
         for (size_t i = 0; i + 2 < d.size(); i += 3) {
           uint8_t p = d[i];
           int v = (d[i + 1] << 8) | d[i + 2];
@@ -503,6 +583,7 @@ sensor:
               pubt(id(hw_cfg_gas_type), v < 5 ? GT[v] : unk);
               break;
             }
+            case 109: pub(id(hw_exhaust_temp), tc_cfg(d[i + 1] + d[i + 2] / 100.0f)); break;
             case 21: pubt(id(hw_cfg_appliance_type), v == 0 ? "Residential" : v == 1 ? "Commercial" : unk); break;
           }
         }
@@ -648,6 +729,14 @@ sensor:
   - platform: template
     id: hw_cabinet_temp
     name: "Hot Water Cabinet Temperature"
+    device_class: temperature
+    state_class: measurement
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    entity_category: diagnostic
+  - platform: template
+    id: hw_exhaust_temp
+    name: "Hot Water Exhaust Gas Temperature"
     device_class: temperature
     state_class: measurement
     unit_of_measurement: "°C"
@@ -822,6 +911,11 @@ text_sensor:
     icon: "mdi:cog"
     entity_category: diagnostic
   - platform: template
+    id: hw_max_setpoint
+    name: "Hot Water Maximum Setpoint"
+    icon: "mdi:thermometer-high"
+    entity_category: diagnostic
+  - platform: template
     id: hw_cfg_gas_type
     name: "Hot Water Gas Type"
     icon: "mdi:gas-cylinder"
@@ -929,4 +1023,5 @@ number:
                   if (t < 37) t = 37;
                   if (t > 50) t = 50;
                   ESP_LOGI("bosch", "Requesting target temperature %d °C", t);
+                  if (id(bosch_fahrenheit)) t = (int) lroundf(t * 9.0f / 5.0f + 32.0f);
                   return std::vector<int>{2, 0x55, 0, t};
