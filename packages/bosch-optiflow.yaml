@@ -354,11 +354,6 @@ script:
           id: bosch_send
           cmd: 176
           payload: !lambda 'return std::vector<int>{2};'
-      # Exhaust gas temperature (config table, param 109).
-      - script.execute:
-          id: bosch_send
-          cmd: 210
-          payload: !lambda 'return std::vector<int>{6, 109};'
 
 interval:
   - interval: 5min
@@ -509,7 +504,9 @@ sensor:
         pub(id(hw_outlet_temp), tc(d[28] + d[29] / 100.0f));
         pub(id(hw_heat_exchanger_temp), tc(d[3] + d[4] / 100.0f));
         pub(id(hw_cabinet_temp), tc(d[6] + d[7] / 100.0f));
-        pub(id(hw_burner_power), d[9]);
+        // The heater keeps reporting 18 % after the water stops, with the flame
+        // out, so only show a burner power while the flame is on.
+        pub(id(hw_burner_power), (d[10] & 0x10) ? d[9] : 0);
         pub(id(hw_fan_power), d[12]);
         pub(id(hw_fan_speed), d[13]);
         pub(id(hw_air_flow), d[16] + d[17] / 100.0f);
@@ -538,25 +535,9 @@ sensor:
           uint8_t m = d[33] & 0x7F;
           pubt(id(hw_max_setpoint), m < 3 ? MAXSP[m] : "Unknown (" + std::to_string(m) + ")");
         }
-        // Bytes whose meaning isn't known (or never seen non-zero): log
-        // them at DEBUG whenever one changes, to find out what they are.
-        {
-          static uint8_t last_raw[10] = {0};
-          static bool raw_seen = false;
-          const uint8_t raw[10] = {d[10], d[14], d[15], d[20], d[21], d[24], d[25], d[26], d[27], d[30]};
-          if (!raw_seen || memcmp(raw, last_raw, sizeof(raw)) != 0 || d[31] != 0) {
-            ESP_LOGD("bosch", "Status bytes d10=%02X d14=%02X d15=%02X d20=%02X d21=%02X d24=%02X "
-                              "d25(flue)=%02X d26=%02X d27(pressure)=%02X d30=%02X d31=%02X d32=%02X d33=%02X",
-                     raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8], raw[9],
-                     d[31], d[32], d[33]);
-            memcpy(last_raw, raw, sizeof(raw));
-            raw_seen = true;
-          }
-        }
 
       } else if (cmd == 0xD2) {
         // Parameter read reply: [param, value_hi, value_lo] per parameter.
-        auto tc_cfg = [&](float t) { return id(bosch_fahrenheit) ? (t - 32.0f) * 5.0f / 9.0f : t; };
         for (size_t i = 0; i + 2 < d.size(); i += 3) {
           uint8_t p = d[i];
           int v = (d[i + 1] << 8) | d[i + 2];
@@ -583,7 +564,6 @@ sensor:
               pubt(id(hw_cfg_gas_type), v < 5 ? GT[v] : unk);
               break;
             }
-            case 109: pub(id(hw_exhaust_temp), tc_cfg(d[i + 1] + d[i + 2] / 100.0f)); break;
             case 21: pubt(id(hw_cfg_appliance_type), v == 0 ? "Residential" : v == 1 ? "Commercial" : unk); break;
           }
         }
@@ -729,14 +709,6 @@ sensor:
   - platform: template
     id: hw_cabinet_temp
     name: "Hot Water Cabinet Temperature"
-    device_class: temperature
-    state_class: measurement
-    unit_of_measurement: "°C"
-    accuracy_decimals: 1
-    entity_category: diagnostic
-  - platform: template
-    id: hw_exhaust_temp
-    name: "Hot Water Exhaust Gas Temperature"
     device_class: temperature
     state_class: measurement
     unit_of_measurement: "°C"

@@ -25,14 +25,14 @@ underneath you, pin both to a [release](https://github.com/scottbambrick/ha-bosc
 
 ```yaml
 substitutions:
-  bosch_ref: v1.1.0          # the C++ helpers
+  bosch_ref: v1.1.1          # the C++ helpers
 packages:
-  bosch: github://scottbambrick/ha-bosch-optiflow/packages/bosch-optiflow.yaml@v1.1.0
+  bosch: github://scottbambrick/ha-bosch-optiflow/packages/bosch-optiflow.yaml@v1.1.1
 ```
 
 ## Entities
 
-Sensors: target / inlet / outlet / heat-exchanger / cabinet temperature, exhaust gas temperature, flow, burner power, fan power and speed, air flow, air and gas setpoints, last use (water, gas, duration), lifetime water volume and gas, operating hours and cycles.
+Sensors: target / inlet / outlet / heat-exchanger / cabinet temperature, flow, burner power (0 while the flame is out), fan power and speed, air flow, air and gas setpoints, last use (water, gas, duration), lifetime water volume and gas, operating hours and cycles.
 Binary sensors: running, flame, fault, bathroom controller active.
 Text sensors: active/last fault, fault history, recent uses, operation mode, gas type, country variant, capacity, installation, appliance type, setpoint limit, maximum setpoint, unit, firmware (main and safety).
 Controls: set temperature, disconnect, reconnect.
