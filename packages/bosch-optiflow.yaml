@@ -443,7 +443,7 @@ sensor:
       std::vector<uint8_t> d(body.begin() + 4, body.end() - 1);
       // Login replies come from the login handler (0xAB): [step, status].
       if (cmd == 0xA2 && body[0] == 0xAB && d.size() >= 2) {
-        if (d[0] == 7 && (d[1] == 1 || d[1] == 2)) {
+        if (d[0] == 7 && d[1] <= 2) {  // 1 = known device, 2 = needs the PIN, 0 = unknown device: the app asks for the PIN in all three
           ESP_LOGD("bosch", "Login step 1 accepted - sending PIN");
           id(bosch_login_pass).execute();
         } else if (d[0] == 8 && d[1] == 1) {
@@ -714,30 +714,34 @@ sensor:
     unit_of_measurement: "°C"
     accuracy_decimals: 1
     entity_category: diagnostic
-  # Units for burner/fan/air/gas values aren't stated in the app; these are
-  # the raw numbers it displays.
+  # Units as shown by the official app: burner power %, fan power W, fan speed
+  # Hz, air flow L/s, gas flow L/min.
   - platform: template
     id: hw_burner_power
     name: "Hot Water Burner Power"
     icon: "mdi:fire"
+    unit_of_measurement: "%"
     state_class: measurement
     entity_category: diagnostic
   - platform: template
     id: hw_fan_power
     name: "Hot Water Fan Power"
     icon: "mdi:fan"
+    unit_of_measurement: "W"
     state_class: measurement
     entity_category: diagnostic
   - platform: template
     id: hw_fan_speed
     name: "Hot Water Fan Speed"
     icon: "mdi:fan"
+    unit_of_measurement: "Hz"
     state_class: measurement
     entity_category: diagnostic
   - platform: template
     id: hw_air_flow
     name: "Hot Water Air Flow"
     icon: "mdi:weather-windy"
+    unit_of_measurement: "L/s"
     state_class: measurement
     accuracy_decimals: 2
     entity_category: diagnostic
@@ -745,6 +749,7 @@ sensor:
     id: hw_air_setpoint
     name: "Hot Water Air Setpoint"
     icon: "mdi:weather-windy"
+    unit_of_measurement: "L/s"
     state_class: measurement
     accuracy_decimals: 2
     entity_category: diagnostic
@@ -752,6 +757,7 @@ sensor:
     id: hw_gas_setpoint
     name: "Hot Water Gas Setpoint"
     icon: "mdi:gas-burner"
+    unit_of_measurement: "L/min"
     state_class: measurement
     accuracy_decimals: 2
     entity_category: diagnostic
@@ -995,5 +1001,8 @@ number:
                   if (t < 37) t = 37;
                   if (t > 50) t = 50;
                   ESP_LOGI("bosch", "Requesting target temperature %d °C", t);
-                  if (id(bosch_fahrenheit)) t = (int) lroundf(t * 9.0f / 5.0f + 32.0f);
+                  if (id(bosch_fahrenheit)) {
+                    t = (int) lroundf(t * 9.0f / 5.0f + 32.0f);
+                    if (t < 100) t = 100;  // the app's floor in °F
+                  }
                   return std::vector<int>{2, 0x55, 0, t};

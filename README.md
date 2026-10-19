@@ -25,14 +25,14 @@ underneath you, pin both to a [release](https://github.com/scottbambrick/ha-bosc
 
 ```yaml
 substitutions:
-  bosch_ref: v1.1.1          # the C++ helpers
+  bosch_ref: v1.1.2          # the C++ helpers
 packages:
-  bosch: github://scottbambrick/ha-bosch-optiflow/packages/bosch-optiflow.yaml@v1.1.1
+  bosch: github://scottbambrick/ha-bosch-optiflow/packages/bosch-optiflow.yaml@v1.1.2
 ```
 
 ## Entities
 
-Sensors: target / inlet / outlet / heat-exchanger / cabinet temperature, flow, burner power (0 while the flame is out), fan power and speed, air flow, air and gas setpoints, last use (water, gas, duration), lifetime water volume and gas, operating hours and cycles.
+Sensors: target / inlet / outlet / heat-exchanger / cabinet temperature, flow, burner power (%, 0 while the flame is out), fan power (W) and speed (Hz), air flow (L/s), air and gas setpoints, last use (water, gas, duration), lifetime water volume and gas, operating hours and cycles.
 Binary sensors: running, flame, fault, bathroom controller active.
 Text sensors: active/last fault, fault history, recent uses, operation mode, gas type, country variant, capacity, installation, appliance type, setpoint limit, maximum setpoint, unit, firmware (main and safety).
 Controls: set temperature, disconnect, reconnect.
@@ -50,6 +50,7 @@ See the header comment of [`packages/bosch-optiflow.yaml`](packages/bosch-optifl
 - Frames on characteristic `EDB2`: `7B 7B | sender receiver msg_id command data... | checksum | 7D 7D`, checksum = sum of the bytes between the markers mod 256, with byte stuffing (a `7B`/`7D` inside the frame is followed by `00`).
 - Every byte is XORed with the ASCII key `1ag3.-fs7`, repeating and restarting at the start of each 20-byte BLE packet.
 - Login is two steps (`0xA2`): "connect", then the PIN digits.
+- Parameter replies (`0xD2`, location 2) for air flow `0x27`, air setpoint `0x28`, gas `0x2B`, fan voltage `0x1B`, fan power `0x1D`, fan speed `0x1E` and water flow `0x02` are `[id, hi, lo]` with a 16-bit big-endian value in tenths. In the `0xA0` broadcast the air flow, air setpoint and gas values are an integer byte followed by a byte of hundredths, in that order (so `d[16]`+`d[17]`/100, not the other way round).
 - Commands: `0xA0` status broadcast (~4 s), `0xD2` read parameter, `0xD3` write parameter, `0xD7` fault history, `0xD8` firmware version, `0xB0` usage history.
 
 ## Licence
