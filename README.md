@@ -25,16 +25,16 @@ underneath you, pin both to a [release](https://github.com/scottbambrick/ha-bosc
 
 ```yaml
 substitutions:
-  bosch_ref: v1.1.2          # the C++ helpers
+  bosch_ref: v1.1.3          # the C++ helpers
 packages:
-  bosch: github://scottbambrick/ha-bosch-optiflow/packages/bosch-optiflow.yaml@v1.1.2
+  bosch: github://scottbambrick/ha-bosch-optiflow/packages/bosch-optiflow.yaml@v1.1.3
 ```
 
 ## Entities
 
-Sensors: target / inlet / outlet / heat-exchanger / cabinet temperature, flow, burner power (%, 0 while the flame is out), fan power (W) and speed (Hz), air flow (L/s), air and gas setpoints, last use (water, gas, duration), lifetime water volume and gas, operating hours and cycles.
+Sensors: target / inlet / outlet / heat-exchanger / cabinet temperature, flow, burner power (%, 0 while the flame is out), fan power (W) and speed (Hz), air flow (L/s), air and gas setpoints, gas/air pressure (mbar, experimental), last use (water, gas, duration), lifetime water volume and gas, operating hours and cycles.
 Binary sensors: running, flame, fault, bathroom controller active.
-Text sensors: active/last fault, fault history, recent uses, operation mode, gas type, country variant, capacity, installation, appliance type, setpoint limit, maximum setpoint, unit, firmware (main and safety).
+Text sensors: active/last fault, fault history, recent uses, operation mode, gas type, country variant, capacity, installation, appliance type, setpoint limit, maximum setpoint, unit, firmware (main and safety), status flags (raw hex of the heater's flag byte, experimental).
 Controls: set temperature, disconnect, reconnect.
 
 The two volume totals are counted from the heater's own use history, so they keep running across reboots and are suitable for the Energy dashboard. If the heater is set to °F, temperatures are converted to °C (and the set temperature converted back when written). The one-off configuration reads are repeated if a reply goes missing. The pairing code is read as six hex characters, as the official app does. A use list that arrives corrupted over BLE (a use of over 1500 L or 12 hours) is ignored rather than counted.

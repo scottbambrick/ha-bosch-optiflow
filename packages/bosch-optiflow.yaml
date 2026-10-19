@@ -513,6 +513,16 @@ sensor:
         pub(id(hw_air_setpoint), d[18] + d[19] / 100.0f);
         pub(id(hw_gas_setpoint), d[22] + d[23] / 100.0f);
         pubb(id(hw_flame), (d[10] & 0x10) != 0);
+        // Experimental. d[30] (signed) + d[31]/100 looks like the gas/air pressure
+        // difference in mbar (about 1 at idle, swinging while burning). d[10] is a
+        // set of safety flags; only bit 4 (flame) is confirmed.
+        {
+          int8_t whole = (int8_t) d[30];
+          pub(id(hw_gas_air_pressure), whole < 0 ? whole - d[31] / 100.0f : whole + d[31] / 100.0f);
+          char fl[8];
+          snprintf(fl, sizeof(fl), "0x%02X", d[10]);
+          pubt(id(hw_status_flags), fl);
+        }
         pubt(id(hw_operation_mode), "Mode " + std::to_string(d[32] + 1));
         // Active fault.
         if (d[11] != last_fault) {
@@ -761,6 +771,14 @@ sensor:
     state_class: measurement
     accuracy_decimals: 2
     entity_category: diagnostic
+  - platform: template
+    id: hw_gas_air_pressure
+    name: "Hot Water Gas Air Pressure"
+    icon: "mdi:gauge"
+    unit_of_measurement: "mbar"
+    state_class: measurement
+    accuracy_decimals: 2
+    entity_category: diagnostic
 
   # --- Most recent hot water use (every 5 min) --------------------------------
   - platform: template
@@ -887,6 +905,11 @@ text_sensor:
     id: hw_operation_mode
     name: "Hot Water Operation Mode"
     icon: "mdi:cog"
+    entity_category: diagnostic
+  - platform: template
+    id: hw_status_flags
+    name: "Hot Water Status Flags"
+    icon: "mdi:flag-variant"
     entity_category: diagnostic
   - platform: template
     id: hw_max_setpoint
