@@ -25,9 +25,9 @@ underneath you, pin both to a [release](https://github.com/scottbambrick/ha-bosc
 
 ```yaml
 substitutions:
-  bosch_ref: v1.1.3          # the C++ helpers
+  bosch_ref: v1.1.4          # the C++ helpers
 packages:
-  bosch: github://scottbambrick/ha-bosch-optiflow/packages/bosch-optiflow.yaml@v1.1.3
+  bosch: github://scottbambrick/ha-bosch-optiflow/packages/bosch-optiflow.yaml@v1.1.4
 ```
 
 ## Entities
