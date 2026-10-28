@@ -19,7 +19,7 @@ jobs:
         with:
           python-version: "3.13"
       - name: Install ESPHome
-        run: pip install "esphome==2026.9.1"
+        run: pip install "esphome==2026.10.1"
       - name: Use this checkout's package, add dummy secrets
         run: |
           sed 's#bosch: github://scottbambrick/ha-bosch-optiflow/packages/bosch-optiflow.yaml@main#bosch: !include packages/bosch-optiflow.yaml#' \
