@@ -4,6 +4,7 @@ No configuration: loading this component just makes bosch_optiflow.h (frame
 encoding, decoding and checksum helpers) available to the lambdas in
 packages/bosch-optiflow.yaml.
 """
+
 import esphome.codegen as cg
 import esphome.config_validation as cv
 
